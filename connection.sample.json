@@ -1,0 +1,30 @@
+{
+  "username": "XXXXXXXXXX",
+  "password": "your-campus-password",
+  "gateway_urls": [
+    "https://gw.buaa.edu.cn/",
+    "http://gw.buaa.edu.cn:801/",
+    "http://10.111.3.3/"
+  ],
+  "ac_id": "67",
+  "check_interval_seconds": 60,
+  "probe_urls": [
+    {
+      "url": "http://connectivitycheck.gstatic.com/generate_204",
+      "expect_status": 204
+    },
+    {
+      "url": "http://www.msftconnecttest.com/connecttest.txt",
+      "expect_status": 200,
+      "expect_text": "Microsoft Connect Test"
+    }
+  ],
+  "auth_timeout_seconds": 8,
+  "http_auth_retry_count": 2,
+  "headless_fallback_enabled": true,
+  "headless_fallback_after_failures": 3,
+  "headless_timeout_seconds": 45,
+  "log_file": "connection.log",
+  "log_max_bytes": 1048576,
+  "log_backup_count": 3
+}

@@ -1,0 +1,5 @@
+connection.local.json
+connection.log
+connection.log.*
+__pycache__/
+.pytest_cache/
