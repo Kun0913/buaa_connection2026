@@ -3,3 +3,5 @@ connection.log
 connection.log.*
 __pycache__/
 .pytest_cache/
+.vscode/
+.auth-setting
