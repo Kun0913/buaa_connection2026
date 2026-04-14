@@ -1,4 +1,6 @@
 connection.local.json
+connection.credentials.enc
+connection.credentials.key
 connection.log
 connection.log.*
 __pycache__/

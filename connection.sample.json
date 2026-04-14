@@ -1,4 +1,6 @@
 {
+  "credential_file": "",
+  "credential_key_file": "",
   "username": "XXXXXXXXXX",
   "password": "your-campus-password",
   "gateway_urls": [

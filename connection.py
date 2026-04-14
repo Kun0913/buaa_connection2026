@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -14,6 +16,7 @@ import sys
 import time
 from ctypes import c_int32
 from dataclasses import dataclass, field
+from getpass import getpass
 from hashlib import md5, sha1
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -65,6 +68,11 @@ DEFAULT_LOG_BACKUP_COUNT = 3
 DEFAULT_INITIAL_BACKOFF_SECONDS = 5
 DEFAULT_MAX_BACKOFF_SECONDS = 600
 POST_AUTH_SETTLE_SECONDS = 2
+ENCRYPTED_CREDENTIALS_ENV_VAR = "BUAA_CONNECTION_SECRET"
+DEFAULT_CREDENTIAL_FILE_NAME = "connection.credentials.enc"
+DEFAULT_CREDENTIAL_KEY_FILE_NAME = "connection.credentials.key"
+CREDENTIAL_FILE_VERSION = 1
+PBKDF2_ITERATIONS = 200_000
 SRUN_BASE64_ALPHABET = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
 USERNAME_SELECTORS = [
     "input[name='username']",
@@ -139,6 +147,8 @@ class Config:
     log_max_bytes: int = DEFAULT_LOG_MAX_BYTES
     log_backup_count: int = DEFAULT_LOG_BACKUP_COUNT
     config_path: Path = DEFAULT_CONFIG_PATH
+    credential_file: Path | None = None
+    credential_key_file: Path | None = None
 
 
 @dataclass(slots=True)
@@ -181,11 +191,26 @@ def import_playwright_sync():
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="BUAA campus network auto-auth helper")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to connection.local.json")
+    parser.add_argument(
+        "--secret-passphrase",
+        default=None,
+        help=f"Passphrase for encrypted credentials. Can also be provided via {ENCRYPTED_CREDENTIALS_ENV_VAR}.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("run", help="Run the monitoring loop")
     subparsers.add_parser("status", help="Check status once")
     subparsers.add_parser("auth", help="Attempt one HTTP authentication now")
     subparsers.add_parser("doctor", help="Check config, gateway access and Playwright runtime")
+    seal_parser = subparsers.add_parser("seal", help="Create encrypted credential file")
+    seal_parser.add_argument("--from-config", action="store_true", help="Read plaintext username/password from the current config")
+    seal_parser.add_argument("--output", default=None, help=f"Output path for encrypted credentials (default: {DEFAULT_CREDENTIAL_FILE_NAME})")
+    seal_parser.add_argument(
+        "--key-file",
+        nargs="?",
+        const="",
+        default=None,
+        help=f"Use key-file mode and write the generated key to this path (default: {DEFAULT_CREDENTIAL_KEY_FILE_NAME})",
+    )
     return parser.parse_args(argv)
 
 
@@ -240,9 +265,19 @@ def dedupe_preserve_order(values: Iterable[str]) -> list[str]:
     return result
 
 
-def load_config(config_path: Path | None = None, auth_setting_path: Path | None = None) -> Config:
-    config_path = (config_path or DEFAULT_CONFIG_PATH).resolve()
-    auth_setting_path = (auth_setting_path or DEFAULT_AUTH_SETTING_PATH).resolve()
+def resolve_path_from_config(config_path: Path, value: Any, default_name: str | None = None) -> Path | None:
+    raw = str(value or "").strip()
+    if not raw:
+        if default_name is None:
+            return None
+        raw = default_name
+    path = Path(raw)
+    if not path.is_absolute():
+        path = config_path.parent / path
+    return path.resolve()
+
+
+def load_raw_config(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         raise ConfigError(
             f"Config file not found: {config_path}. Copy {DEFAULT_SAMPLE_CONFIG_PATH.name} to {config_path.name} and fill in your credentials."
@@ -253,11 +288,160 @@ def load_config(config_path: Path | None = None, auth_setting_path: Path | None 
         raise ConfigError(f"Config file is not valid JSON: {config_path}") from exc
     if not isinstance(raw_config, dict):
         raise ConfigError("Config root must be a JSON object")
-    auth_settings = read_auth_setting(auth_setting_path)
+    return raw_config
+
+
+def load_plain_credentials(raw_config: dict[str, Any]) -> tuple[str, str]:
     username = str(raw_config.get("username", "")).strip()
     password = str(raw_config.get("password", "")).strip()
     if not username or not password:
         raise ConfigError("Config must provide non-empty username and password")
+    return username, password
+
+
+def resolve_secret_passphrase(cli_passphrase: str | None) -> str | None:
+    value = cli_passphrase if cli_passphrase is not None else os.environ.get(ENCRYPTED_CREDENTIALS_ENV_VAR)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def import_aesgcm():
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError as exc:
+        raise DependencyError("cryptography is not installed. Install it with: pip install cryptography") from exc
+    return AESGCM
+
+
+def derive_passphrase_key(passphrase: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, PBKDF2_ITERATIONS, dklen=32)
+
+
+def _b64decode(value: Any, field_name: str) -> bytes:
+    text = str(value or "").strip()
+    if not text:
+        return b""
+    try:
+        return base64.b64decode(text.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise ConfigError(f"Invalid base64 data for {field_name}") from exc
+
+
+def write_private_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    if os.name != "nt":
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+
+def read_key_file(path: Path) -> bytes:
+    if not path.exists():
+        raise ConfigError(f"Credential key file not found: {path}")
+    key = _b64decode(path.read_text(encoding="utf-8"), "credential key")
+    if len(key) != 32:
+        raise ConfigError(f"Credential key file must decode to 32 bytes: {path}")
+    return key
+
+
+def encrypt_credentials(username: str, password: str, passphrase: str | None = None, key_file_path: Path | None = None) -> dict[str, Any]:
+    AESGCM = import_aesgcm()
+    if key_file_path is not None:
+        key = os.urandom(32)
+        scheme = "aesgcm-keyfile"
+        salt = b""
+        write_private_text(key_file_path, base64.b64encode(key).decode("ascii") + "\n")
+    else:
+        if not passphrase:
+            raise ConfigError("A non-empty passphrase is required when --key-file is not used")
+        key = derive_passphrase_key(passphrase, salt := os.urandom(16))
+        scheme = "aesgcm-pbkdf2-sha256"
+    nonce = os.urandom(12)
+    payload = json.dumps({"username": username, "password": password}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ciphertext = AESGCM(key).encrypt(nonce, payload, None)
+    return {
+        "version": CREDENTIAL_FILE_VERSION,
+        "scheme": scheme,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+    }
+
+
+def decrypt_credentials(credential_file: Path, cli_passphrase: str | None = None, credential_key_file: Path | None = None) -> tuple[str, str]:
+    if not credential_file.exists():
+        raise ConfigError(f"Encrypted credential file not found: {credential_file}")
+    try:
+        payload = json.loads(credential_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"Encrypted credential file is not valid JSON: {credential_file}") from exc
+    if not isinstance(payload, dict):
+        raise ConfigError("Encrypted credential file root must be a JSON object")
+    version = payload.get("version")
+    if version != CREDENTIAL_FILE_VERSION:
+        raise ConfigError(f"Unsupported credential file version: {version!r}")
+    scheme = str(payload.get("scheme", "")).strip()
+    salt = _b64decode(payload.get("salt"), "salt")
+    nonce = _b64decode(payload.get("nonce"), "nonce")
+    ciphertext = _b64decode(payload.get("ciphertext"), "ciphertext")
+    if len(nonce) != 12:
+        raise ConfigError("Encrypted credential file nonce must decode to 12 bytes")
+    if not ciphertext:
+        raise ConfigError("Encrypted credential file ciphertext cannot be empty")
+    if scheme == "aesgcm-pbkdf2-sha256":
+        passphrase = resolve_secret_passphrase(cli_passphrase)
+        if not passphrase:
+            raise ConfigError(
+                f"Encrypted credentials require a passphrase. Provide --secret-passphrase or set {ENCRYPTED_CREDENTIALS_ENV_VAR}."
+            )
+        if len(salt) != 16:
+            raise ConfigError("Encrypted credential file salt must decode to 16 bytes")
+        key = derive_passphrase_key(passphrase, salt)
+    elif scheme == "aesgcm-keyfile":
+        if credential_key_file is None:
+            raise ConfigError("Encrypted credentials require credential_key_file in the config")
+        key = read_key_file(credential_key_file)
+    else:
+        raise ConfigError(f"Unsupported credential encryption scheme: {scheme!r}")
+    AESGCM = import_aesgcm()
+    try:
+        plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+    except Exception as exc:
+        raise ConfigError("Failed to decrypt encrypted credentials. Check the passphrase or key file.") from exc
+    try:
+        data = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError("Decrypted credential payload is invalid") from exc
+    if not isinstance(data, dict):
+        raise ConfigError("Decrypted credential payload must be a JSON object")
+    return load_plain_credentials(data)
+
+
+def load_credentials(
+    raw_config: dict[str, Any],
+    config_path: Path,
+    secret_passphrase: str | None = None,
+) -> tuple[str, str, Path | None, Path | None]:
+    credential_file = resolve_path_from_config(config_path, raw_config.get("credential_file"))
+    credential_key_file = resolve_path_from_config(config_path, raw_config.get("credential_key_file"))
+    if credential_file is not None:
+        username, password = decrypt_credentials(credential_file, secret_passphrase, credential_key_file)
+        return username, password, credential_file, credential_key_file
+    username, password = load_plain_credentials(raw_config)
+    return username, password, None, credential_key_file
+
+
+def load_config(
+    config_path: Path | None = None,
+    auth_setting_path: Path | None = None,
+    secret_passphrase: str | None = None,
+) -> Config:
+    config_path = (config_path or DEFAULT_CONFIG_PATH).resolve()
+    auth_setting_path = (auth_setting_path or DEFAULT_AUTH_SETTING_PATH).resolve()
+    raw_config = load_raw_config(config_path)
+    auth_settings = read_auth_setting(auth_setting_path)
+    username, password, credential_file, credential_key_file = load_credentials(raw_config, config_path, secret_passphrase)
     raw_gateway_urls = raw_config.get("gateway_urls") or DEFAULT_GATEWAY_URLS
     if not isinstance(raw_gateway_urls, list) or not raw_gateway_urls:
         raise ConfigError("gateway_urls must be a non-empty list")
@@ -288,6 +472,8 @@ def load_config(config_path: Path | None = None, auth_setting_path: Path | None 
         log_max_bytes=max(1024, _as_int(raw_config.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES), "log_max_bytes")),
         log_backup_count=max(1, _as_int(raw_config.get("log_backup_count", DEFAULT_LOG_BACKUP_COUNT), "log_backup_count")),
         config_path=config_path,
+        credential_file=credential_file,
+        credential_key_file=credential_key_file,
     )
 
 
@@ -440,7 +626,7 @@ def response_indicates_success(data: dict[str, Any]) -> bool:
 
 def detect_config_permission_warning(config_path: Path) -> str | None:
     if os.name == "nt":
-        return "Windows: keep connection.local.json under a user-only directory."
+        return "Windows: keep config and credential files under a user-only directory."
     mode = config_path.stat().st_mode & 0o777
     if mode & 0o077:
         return f"Linux permissions are too open for {config_path.name}: {oct(mode)}. Recommended: chmod 600 {config_path.name}"
@@ -451,6 +637,66 @@ def next_backoff_seconds(previous_backoff_seconds: int, minimum_seconds: int = D
     if previous_backoff_seconds <= 0:
         return max(minimum_seconds, DEFAULT_INITIAL_BACKOFF_SECONDS)
     return min(max(previous_backoff_seconds * 2, minimum_seconds), DEFAULT_MAX_BACKOFF_SECONDS)
+
+
+def prompt_non_empty(prompt_text: str, secret: bool = False) -> str:
+    while True:
+        value = (getpass(prompt_text) if secret else input(prompt_text)).strip()
+        if value:
+            return value
+        print("error=Input cannot be empty.", file=sys.stderr)
+
+
+def prompt_passphrase() -> str:
+    while True:
+        passphrase = getpass("Secret passphrase: ").strip()
+        if not passphrase:
+            print("error=Passphrase cannot be empty.", file=sys.stderr)
+            continue
+        confirm = getpass("Confirm passphrase: ").strip()
+        if passphrase != confirm:
+            print("error=Passphrases did not match.", file=sys.stderr)
+            continue
+        return passphrase
+
+
+def write_encrypted_credentials_file(
+    output_path: Path,
+    username: str,
+    password: str,
+    passphrase: str | None = None,
+    key_file_path: Path | None = None,
+) -> None:
+    if output_path.exists():
+        raise ConfigError(f"Refusing to overwrite existing credential file: {output_path}")
+    if key_file_path is not None and key_file_path.exists():
+        raise ConfigError(f"Refusing to overwrite existing credential key file: {key_file_path}")
+    payload = encrypt_credentials(username, password, passphrase, key_file_path)
+    write_private_text(output_path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def seal_credentials(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).resolve()
+    output_path = resolve_path_from_config(config_path, args.output, DEFAULT_CREDENTIAL_FILE_NAME)
+    if output_path is None:
+        raise ConfigError("Failed to resolve the encrypted credential output path")
+    key_file_path = resolve_path_from_config(config_path, args.key_file, DEFAULT_CREDENTIAL_KEY_FILE_NAME) if args.key_file else None
+    if args.from_config:
+        raw_config = load_raw_config(config_path)
+        username, password = load_plain_credentials(raw_config)
+    else:
+        username = prompt_non_empty("Username: ")
+        password = prompt_non_empty("Password: ", secret=True)
+    if key_file_path is not None:
+        write_encrypted_credentials_file(output_path, username, password, key_file_path=key_file_path)
+        print(f"credential_file={output_path}")
+        print(f"credential_key_file={key_file_path}")
+    else:
+        write_encrypted_credentials_file(output_path, username, password, passphrase=prompt_passphrase())
+        print(f"credential_file={output_path}")
+        print(f"secret_env_var={ENCRYPTED_CREDENTIALS_ENV_VAR}")
+    print("message=Add credential_file to your config and remove plaintext username/password after verifying.")
+    return 0
 
 
 class CampusAuthService:
@@ -698,7 +944,7 @@ class CampusAuthService:
             issue = self.check_headless_runtime()
             if issue:
                 raise DependencyError(issue)
-        signal.signal(signal.SIGINT, self.request_stop)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
         try:
             signal.signal(signal.SIGTERM, self.request_stop)
         except AttributeError:  # pragma: no cover
@@ -740,15 +986,17 @@ class CampusAuthService:
         return 0
 
 
-def build_service(config_path: Path) -> CampusAuthService:
-    config = load_config(config_path=config_path)
+def build_service(config_path: Path, secret_passphrase: str | None = None) -> CampusAuthService:
+    config = load_config(config_path=config_path, secret_passphrase=secret_passphrase)
     return CampusAuthService(config=config, logger=setup_logger(config))
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        service = build_service(Path(args.config))
+        if args.command == "seal":
+            return seal_credentials(args)
+        service = build_service(Path(args.config), secret_passphrase=args.secret_passphrase)
         if args.command == "run":
             return service.run_forever()
         if args.command == "status":

@@ -19,6 +19,21 @@ class FakeResponse:
             raise connection.RequestException(f"HTTP {self.status_code}")
 
 
+class FakeAESGCM:
+    def __init__(self, key: bytes):
+        self.key = key
+
+    def encrypt(self, nonce: bytes, data: bytes, _associated_data):
+        masked = bytes(byte ^ self.key[index % len(self.key)] ^ nonce[index % len(nonce)] for index, byte in enumerate(data))
+        return self.key[:16] + masked
+
+    def decrypt(self, nonce: bytes, data: bytes, _associated_data):
+        if data[:16] != self.key[:16]:
+            raise ValueError("invalid key")
+        masked = data[16:]
+        return bytes(byte ^ self.key[index % len(self.key)] ^ nonce[index % len(nonce)] for index, byte in enumerate(masked))
+
+
 class CampusConnectionTests(unittest.TestCase):
     @staticmethod
     def reference_xencode(msg: str, key: str) -> bytes:
@@ -162,6 +177,120 @@ class CampusConnectionTests(unittest.TestCase):
             status = service.get_status()
         self.assertEqual(status.state, "dependency_missing")
         self.assertIn("missing", status.dependency_issue)
+
+    def test_run_forever_uses_immediate_ctrl_c_handler(self):
+        config = connection.Config(
+            username="by1234567",
+            password="secret",
+            gateway_urls=["http://10.111.3.3/"],
+            ac_id="67",
+            probe_urls=[connection.ProbeTarget(url="http://example.com/ping", expect_status=204)],
+            headless_fallback_enabled=False,
+        )
+        service = connection.CampusAuthService(config=config, session=Mock(), logger=Mock(), sleep_func=lambda _seconds: None)
+        service.probe_internet = Mock(side_effect=KeyboardInterrupt)
+
+        with patch.object(connection.signal, "signal") as signal_mock:
+            with self.assertRaises(KeyboardInterrupt):
+                service.run_forever()
+
+        signal_mock.assert_any_call(connection.signal.SIGINT, connection.signal.default_int_handler)
+        signal_mock.assert_any_call(connection.signal.SIGTERM, service.request_stop)
+
+    def test_load_config_reads_encrypted_credentials_with_passphrase(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(connection, "import_aesgcm", return_value=FakeAESGCM):
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "connection.local.json"
+            encrypted_path = temp_path / "connection.credentials.enc"
+            connection.write_encrypted_credentials_file(encrypted_path, "by1234567", "secret", passphrase="passphrase123")
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "credential_file": encrypted_path.name,
+                        "gateway_urls": ["https://gw.buaa.edu.cn/"],
+                        "probe_urls": ["http://example.com/ping"],
+                        "ac_id": "67",
+                        "headless_fallback_enabled": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = connection.load_config(config_path=config_path, secret_passphrase="passphrase123")
+
+            self.assertEqual(loaded.username, "by1234567")
+            self.assertEqual(loaded.password, "secret")
+            self.assertEqual(loaded.credential_file, encrypted_path.resolve())
+
+    def test_load_config_reads_encrypted_credentials_with_key_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(connection, "import_aesgcm", return_value=FakeAESGCM):
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "connection.local.json"
+            encrypted_path = temp_path / "connection.credentials.enc"
+            key_path = temp_path / "connection.credentials.key"
+            connection.write_encrypted_credentials_file(encrypted_path, "by1234567", "secret", key_file_path=key_path)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "credential_file": encrypted_path.name,
+                        "credential_key_file": key_path.name,
+                        "gateway_urls": ["https://gw.buaa.edu.cn/"],
+                        "probe_urls": ["http://example.com/ping"],
+                        "ac_id": "67",
+                        "headless_fallback_enabled": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = connection.load_config(config_path=config_path)
+
+            self.assertEqual(loaded.username, "by1234567")
+            self.assertEqual(loaded.password, "secret")
+            self.assertEqual(loaded.credential_key_file, key_path.resolve())
+
+    def test_load_config_rejects_wrong_passphrase(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(connection, "import_aesgcm", return_value=FakeAESGCM):
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "connection.local.json"
+            encrypted_path = temp_path / "connection.credentials.enc"
+            connection.write_encrypted_credentials_file(encrypted_path, "by1234567", "secret", passphrase="correct-passphrase")
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "credential_file": encrypted_path.name,
+                        "gateway_urls": ["https://gw.buaa.edu.cn/"],
+                        "probe_urls": ["http://example.com/ping"],
+                        "ac_id": "67",
+                        "headless_fallback_enabled": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(connection.ConfigError):
+                connection.load_config(config_path=config_path, secret_passphrase="wrong-passphrase")
+
+    def test_main_seal_from_config_creates_encrypted_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(connection, "import_aesgcm", return_value=FakeAESGCM):
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "connection.local.json"
+            output_path = temp_path / "sealed.enc"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "username": "by1234567",
+                        "password": "secret",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(connection, "getpass", side_effect=["passphrase123", "passphrase123"]):
+                exit_code = connection.main(["--config", str(config_path), "seal", "--from-config", "--output", str(output_path)])
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(output_path.exists())
 
 
 if __name__ == "__main__":

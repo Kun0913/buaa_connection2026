@@ -15,12 +15,14 @@
 
 - Python 3.10+
 - `requests`
+- `cryptography`（启用加密凭据时需要）
 - 可选：`playwright` 与 Chromium
 
 安装示例：
 
 ```bash
 pip install requests
+pip install cryptography
 pip install playwright
 playwright install chromium
 ```
@@ -41,7 +43,7 @@ Linux / macOS 可用：
 cp connection.sample.json connection.local.json
 ```
 
-然后编辑 `connection.local.json`，至少填写：
+明文方式下，编辑 `connection.local.json`，至少填写：
 
 ```json
 {
@@ -50,10 +52,29 @@ cp connection.sample.json connection.local.json
 }
 ```
 
+如果希望避免把账号密码明文保存在 JSON 中，可以改用加密凭据文件：
+
+```json
+{
+  "credential_file": "connection.credentials.enc"
+}
+```
+
+如果使用密钥文件自动解密，再额外加上：
+
+```json
+{
+  "credential_file": "connection.credentials.enc",
+  "credential_key_file": "connection.credentials.key"
+}
+```
+
 常用配置项：
 
 - `username`：校园网账号
 - `password`：校园网密码
+- `credential_file`：加密后的账号密码文件路径，配置后优先于明文 `username/password`
+- `credential_key_file`：密钥文件路径，仅在密钥文件自动解密模式下使用
 - `gateway_urls`：候选网关地址
 - `ac_id`：认证区域 ID，默认可用 `67`
 - `check_interval_seconds`：检查间隔，默认 `60`
@@ -61,6 +82,70 @@ cp connection.sample.json connection.local.json
 - `headless_fallback_enabled`：是否启用无头浏览器兜底
 - `headless_fallback_after_failures`：连续失败多少次后启用兜底
 - `headless_timeout_seconds`：无头浏览器超时时间
+
+## 加密凭据
+
+首次录入账号密码时，推荐使用交互式命令生成密文文件：
+
+```bash
+python connection.py seal
+```
+
+命令会：
+
+1. 提示输入用户名
+2. 提示输入密码（不回显）
+3. 提示输入解密口令并生成 `connection.credentials.enc`
+
+如果已经在 `connection.local.json` 中写了明文账号密码，也可以直接迁移：
+
+```bash
+python connection.py seal --from-config
+```
+
+如果希望使用独立密钥文件实现无人值守自动解密，可以这样生成：
+
+```bash
+python connection.py seal --from-config --key-file
+```
+
+生成后建议把 `connection.local.json` 改成只保留非敏感配置，例如：
+
+```json
+{
+  "credential_file": "connection.credentials.enc",
+  "gateway_urls": [
+    "https://gw.buaa.edu.cn/",
+    "http://gw.buaa.edu.cn:801/",
+    "http://10.111.3.3/"
+  ],
+  "ac_id": "67",
+  "check_interval_seconds": 60,
+  "headless_fallback_enabled": true
+}
+```
+
+如果使用“口令解密”模式，运行时提供口令：
+
+```bash
+python connection.py --secret-passphrase "你的解密口令" run
+```
+
+或者通过环境变量提供：
+
+```bash
+set BUAA_CONNECTION_SECRET=你的解密口令
+python connection.py run
+```
+
+Linux / macOS 可用：
+
+```bash
+export BUAA_CONNECTION_SECRET='你的解密口令'
+python connection.py run
+```
+
+如果使用“密钥文件自动解密”模式，并且配置里已经写了 `credential_key_file`，则无需再额外传入口令。
 
 ## 用法
 
@@ -92,6 +177,12 @@ python connection.py run
 
 ```bash
 python connection.py --config /path/to/connection.local.json run
+```
+
+查看加密凭据命令帮助：
+
+```bash
+python connection.py seal --help
 ```
 
 ## 日志
