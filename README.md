@@ -21,6 +21,7 @@
 安装示例：
 
 ```bash
+conda create -n connection python=3.11
 pip install requests
 pip install cryptography
 pip install playwright
