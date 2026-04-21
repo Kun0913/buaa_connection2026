@@ -174,6 +174,11 @@ python connection.py auth
 python connection.py run
 ```
 
+如果存在代理，加
+```bash
+NO_PROXY=gw.buaa.edu.cn,10.111.3.3,localhost,127.0.0.1
+```
+
 如果配置文件不在默认位置，可以显式指定：
 
 ```bash
