@@ -12,13 +12,9 @@
   "check_interval_seconds": 60,
   "probe_urls": [
     {
-      "url": "http://connectivitycheck.gstatic.com/generate_204",
-      "expect_status": 204
-    },
-    {
-      "url": "http://www.msftconnecttest.com/connecttest.txt",
+      "url": "https://www.baidu.com/",
       "expect_status": 200,
-      "expect_text": "Microsoft Connect Test"
+      "expect_text": "百度"
     }
   ],
   "auth_timeout_seconds": 8,

@@ -174,9 +174,11 @@ python connection.py auth
 python connection.py run
 ```
 
-如果存在代理，加
+如果存在代理
 ```bash
-NO_PROXY=gw.buaa.edu.cn,10.111.3.3,localhost,127.0.0.1
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+NO_PROXY=gw.buaa.edu.cn,10.111.3.3,localhost,127.0.0.1,www.baidu.com,baidu.com \
+python connection.py run
 ```
 
 如果配置文件不在默认位置，可以显式指定：
